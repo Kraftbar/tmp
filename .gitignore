@@ -1,0 +1,7 @@
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+main/wifi_secrets.h
+serial.log
+scripts/__pycache__/
