@@ -22,6 +22,10 @@
 #define SEC_RSN 0x01
 #define SEC_WPA 0x02
 #define SEC_WPS 0x04
+#define SEC_PSK 0x08
+#define SEC_8021X 0x10
+#define SEC_SAE 0x20
+#define SEC_OWE 0x40
 
 struct nl_req {
     struct nlmsghdr nlh;
@@ -32,7 +36,7 @@ struct nl_req {
 struct network {
     char bssid[32];
     char ssid[128];
-    char security[32];
+    char security[64];
     char bw[16];
     char bw_source[64];
     char ext_ids[128];
@@ -456,7 +460,35 @@ static int freq_to_channel(int freq) {
 static void summarize_security(struct network *net) {
     const char *base = "Open";
 
-    if ((net->sec_flags & SEC_RSN) && (net->sec_flags & SEC_WPA)) {
+    if (net->sec_flags & SEC_OWE) {
+        base = "OWE";
+    } else if (net->sec_flags & SEC_SAE) {
+        if (net->sec_flags & SEC_PSK) {
+            base = "WPA2/WPA3";
+        } else {
+            base = "WPA3-SAE";
+        }
+    } else if (net->sec_flags & SEC_8021X) {
+        if ((net->sec_flags & SEC_RSN) && (net->sec_flags & SEC_WPA)) {
+            base = "WPA/WPA2-ENT";
+        } else if (net->sec_flags & SEC_RSN) {
+            base = "WPA2-ENT";
+        } else if (net->sec_flags & SEC_WPA) {
+            base = "WPA-ENT";
+        } else {
+            base = "802.1X";
+        }
+    } else if (net->sec_flags & SEC_PSK) {
+        if ((net->sec_flags & SEC_RSN) && (net->sec_flags & SEC_WPA)) {
+            base = "WPA/WPA2-PSK";
+        } else if (net->sec_flags & SEC_RSN) {
+            base = "WPA2-PSK";
+        } else if (net->sec_flags & SEC_WPA) {
+            base = "WPA-PSK";
+        } else {
+            base = "PSK";
+        }
+    } else if ((net->sec_flags & SEC_RSN) && (net->sec_flags & SEC_WPA)) {
         base = "WPA/WPA2";
     } else if (net->sec_flags & SEC_RSN) {
         base = "WPA2";
@@ -466,10 +498,124 @@ static void summarize_security(struct network *net) {
         base = "Protected";
     }
 
+    snprintf(net->security, sizeof(net->security), "%s", base);
     if (net->sec_flags & SEC_WPS) {
-        snprintf(net->security, sizeof(net->security), "%s+WPS", base);
-    } else {
-        snprintf(net->security, sizeof(net->security), "%s", base);
+        strncat(net->security, "+WPS", sizeof(net->security) - strlen(net->security) - 1);
+    }
+}
+
+static uint32_t read_le32(const unsigned char *data) {
+    return (uint32_t) data[0] |
+        ((uint32_t) data[1] << 8) |
+        ((uint32_t) data[2] << 16) |
+        ((uint32_t) data[3] << 24);
+}
+
+static void apply_akm_suite(struct network *net, uint32_t suite) {
+    switch (suite) {
+    case 0x01f25000:
+        net->sec_flags |= SEC_8021X;
+        break;
+    case 0x02f25000:
+        net->sec_flags |= SEC_PSK;
+        break;
+    case 0x01ac0f00:
+        net->sec_flags |= SEC_8021X;
+        break;
+    case 0x02ac0f00:
+        net->sec_flags |= SEC_PSK;
+        break;
+    case 0x08ac0f00:
+        net->sec_flags |= SEC_SAE;
+        break;
+    case 0x12ac0f00:
+        net->sec_flags |= SEC_OWE;
+        break;
+    default:
+        break;
+    }
+}
+
+static void parse_rsn_ie(struct network *net, const unsigned char *data, size_t len) {
+    size_t pos = 0;
+    uint16_t pairwise_count;
+    uint16_t akm_count;
+
+    net->sec_flags |= SEC_RSN;
+
+    if (len < 8) {
+        return;
+    }
+
+    pos += 2;
+    pos += 4;
+
+    if (pos + 2 > len) {
+        return;
+    }
+    pairwise_count = (uint16_t) data[pos] | ((uint16_t) data[pos + 1] << 8);
+    pos += 2 + ((size_t) pairwise_count * 4);
+
+    if (pos + 2 > len) {
+        return;
+    }
+    akm_count = (uint16_t) data[pos] | ((uint16_t) data[pos + 1] << 8);
+    pos += 2;
+
+    for (uint16_t i = 0; i < akm_count; i++) {
+        if (pos + 4 > len) {
+            return;
+        }
+        apply_akm_suite(net, read_le32(data + pos));
+        pos += 4;
+    }
+}
+
+static void parse_vendor_security_ie(struct network *net, const unsigned char *data, size_t len) {
+    size_t pos = 0;
+    uint16_t pairwise_count;
+    uint16_t akm_count;
+
+    if (len < 6) {
+        return;
+    }
+
+    if (!(data[0] == 0x00 && data[1] == 0x50 && data[2] == 0xf2)) {
+        return;
+    }
+
+    if (data[3] == 0x04) {
+        net->sec_flags |= SEC_WPS;
+        return;
+    }
+
+    if (data[3] != 0x01 || len < 14) {
+        return;
+    }
+
+    net->sec_flags |= SEC_WPA;
+    pos += 4;
+    pos += 2;
+    pos += 4;
+
+    if (pos + 2 > len) {
+        return;
+    }
+    pairwise_count = (uint16_t) data[pos] | ((uint16_t) data[pos + 1] << 8);
+    pos += 2 + ((size_t) pairwise_count * 4);
+
+    if (pos + 2 > len) {
+        return;
+    }
+    akm_count = (uint16_t) data[pos] | ((uint16_t) data[pos + 1] << 8);
+    pos += 2;
+
+    for (uint16_t i = 0; i < akm_count; i++) {
+        if (pos + 4 > len) {
+            return;
+        }
+        apply_akm_suite(net, read_le32(data + pos));
+        pos += 4;
     }
 }
 
@@ -774,20 +920,13 @@ static void parse_ies(struct network *net, const unsigned char *ies, size_t len)
         } else if (id == 45) {
             set_standard(net, "11n", 2, "HT capabilities");
         } else if (id == 48) {
-            net->sec_flags |= SEC_RSN;
+            parse_rsn_ie(net, ies + pos, ie_len);
         } else if (id == 191) {
             set_standard(net, "11ac", 3, "VHT capabilities");
         } else if (id == 192) {
             parse_vht_operation(net, ies + pos, ie_len);
         } else if (id == 221 && ie_len >= 4) {
-            const unsigned char *oui = ies + pos;
-            if (oui[0] == 0x00 && oui[1] == 0x50 && oui[2] == 0xf2) {
-                if (oui[3] == 0x01) {
-                    net->sec_flags |= SEC_WPA;
-                } else if (oui[3] == 0x04) {
-                    net->sec_flags |= SEC_WPS;
-                }
-            }
+            parse_vendor_security_ie(net, ies + pos, ie_len);
         } else if (id == 255 && ie_len >= 1) {
             append_ext_id(net, ies[pos]);
             switch (ies[pos]) {
