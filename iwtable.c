@@ -34,7 +34,10 @@ struct network {
     char ssid[128];
     char security[32];
     char bw[16];
+    char bw_source[64];
+    char ext_ids[128];
     char standard[16];
+    char std_source[64];
     int freq;
     int channel;
     uint32_t last_seen_ms;
@@ -53,8 +56,10 @@ struct network_list {
     size_t cap;
 };
 
+static const char *g_debug_bssid = NULL;
+
 static void print_usage(const char *prog) {
-    fprintf(stderr, "Usage: %s [-i <interface>]\n", prog);
+    fprintf(stderr, "Usage: %s [-i <interface>] [--debug-bssid <bssid>]\n", prog);
 }
 
 static void *nla_data(const struct nlattr *attr) {
@@ -468,17 +473,225 @@ static void summarize_security(struct network *net) {
     }
 }
 
-static void set_bw(struct network *net, const char *label, int rank) {
+static int is_debug_bssid(const struct network *net) {
+    return g_debug_bssid != NULL && strcmp(net->bssid, g_debug_bssid) == 0;
+}
+
+static void append_ext_id(struct network *net, unsigned char ext_id) {
+    size_t len = strlen(net->ext_ids);
+
+    if (len >= sizeof(net->ext_ids) - 8) {
+        return;
+    }
+
+    if (len > 0) {
+        snprintf(net->ext_ids + len, sizeof(net->ext_ids) - len, ",%u", ext_id);
+    } else {
+        snprintf(net->ext_ids, sizeof(net->ext_ids), "%u", ext_id);
+    }
+}
+
+static void set_bw(struct network *net, const char *label, int rank, const char *source) {
     if (rank >= net->bw_rank) {
         snprintf(net->bw, sizeof(net->bw), "%s", label);
+        snprintf(net->bw_source, sizeof(net->bw_source), "%s", source);
         net->bw_rank = rank;
     }
 }
 
-static void set_standard(struct network *net, const char *label, int rank) {
+static void set_standard(struct network *net, const char *label, int rank, const char *source) {
     if (rank >= net->std_rank) {
         snprintf(net->standard, sizeof(net->standard), "%s", label);
+        snprintf(net->std_source, sizeof(net->std_source), "%s", source);
         net->std_rank = rank;
+    }
+}
+
+static void set_bw_from_chan_width(struct network *net, uint32_t chan_width) {
+    switch (chan_width) {
+    case NL80211_BSS_CHAN_WIDTH_20:
+        set_bw(net, "20", 1, "nl80211 chan_width 20");
+        break;
+    case NL80211_BSS_CHAN_WIDTH_10:
+        set_bw(net, "10", 2, "nl80211 chan_width 10");
+        break;
+    case NL80211_BSS_CHAN_WIDTH_5:
+        set_bw(net, "5", 2, "nl80211 chan_width 5");
+        break;
+    case NL80211_BSS_CHAN_WIDTH_1:
+        set_bw(net, "1", 2, "nl80211 chan_width 1");
+        break;
+    case NL80211_BSS_CHAN_WIDTH_2:
+        set_bw(net, "2", 2, "nl80211 chan_width 2");
+        break;
+    default:
+        break;
+    }
+}
+
+static void set_bw_from_he_6ghz_width(struct network *net, unsigned char width, unsigned char seg0, unsigned char seg1) {
+    int delta;
+
+    switch (width) {
+    case 0:
+        set_bw(net, "20", 1, "HE 6GHz op width=0");
+        break;
+    case 1:
+        set_bw(net, "40", 3, "HE 6GHz op width=1");
+        break;
+    case 2:
+        set_bw(net, "80", 4, "HE 6GHz op width=2");
+        break;
+    case 3:
+        if (seg1 == 0) {
+            set_bw(net, "160", 5, "HE 6GHz op width=3 seg1=0");
+            break;
+        }
+
+        delta = (int) seg0 - (int) seg1;
+        if (delta < 0) {
+            delta = -delta;
+        }
+
+        if (delta == 8) {
+            set_bw(net, "160", 5, "HE 6GHz op width=3 delta=8");
+        } else {
+            set_bw(net, "80+80", 6, "HE 6GHz op width=3");
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+static void set_bw_from_eht_width(struct network *net, unsigned char width) {
+    switch (width) {
+    case 0:
+        set_bw(net, "20", 1, "EHT op width=0");
+        break;
+    case 1:
+        set_bw(net, "40", 3, "EHT op width=1");
+        break;
+    case 2:
+        set_bw(net, "80", 4, "EHT op width=2");
+        break;
+    case 3:
+        set_bw(net, "160", 5, "EHT op width=3");
+        break;
+    case 4:
+        set_bw(net, "320", 7, "EHT op width=4");
+        break;
+    default:
+        break;
+    }
+}
+
+static void parse_ht_operation(struct network *net, const unsigned char *data, size_t len) {
+    unsigned char ht_info;
+    unsigned char sec_offset;
+
+    if (len < 2) {
+        return;
+    }
+
+    ht_info = data[1];
+    sec_offset = ht_info & 0x3;
+
+    set_standard(net, "11n", 2, "HT operation");
+    if (sec_offset == 1 || sec_offset == 3) {
+        set_bw(net, "40", 3, "HT operation secondary");
+    } else {
+        set_bw(net, "20", 1, "HT operation primary only");
+    }
+}
+
+static void parse_vht_operation(struct network *net, const unsigned char *data, size_t len) {
+    unsigned char width;
+    unsigned char seg0;
+    unsigned char seg1;
+    int delta;
+
+    if (len < 3) {
+        return;
+    }
+
+    width = data[0];
+    seg0 = data[1];
+    seg1 = data[2];
+
+    set_standard(net, "11ac", 3, "VHT operation");
+
+    switch (width) {
+    case 0:
+        break;
+    case 1:
+        if (seg1 == 0) {
+            set_bw(net, "80", 4, "VHT operation width=1");
+            break;
+        }
+
+        delta = (int) seg0 - (int) seg1;
+        if (delta < 0) {
+            delta = -delta;
+        }
+
+        if (delta == 8) {
+            set_bw(net, "160", 5, "VHT operation delta=8");
+        } else {
+            set_bw(net, "80+80", 6, "VHT operation width=1 split");
+        }
+        break;
+    case 2:
+        set_bw(net, "160", 5, "VHT operation width=2");
+        break;
+    case 3:
+        set_bw(net, "80+80", 6, "VHT operation width=3");
+        break;
+    default:
+        break;
+    }
+}
+
+static void parse_he_operation(struct network *net, const unsigned char *data, size_t len) {
+    unsigned char op_params2;
+    int has_6ghz_op;
+
+    if (len < 6) {
+        return;
+    }
+
+    set_standard(net, "11ax", 4, "HE operation");
+
+    op_params2 = data[2];
+    has_6ghz_op = (op_params2 >> 1) & 0x01;
+
+    if (has_6ghz_op && len >= 11) {
+        unsigned char control = data[7];
+        unsigned char width = control & 0x03;
+        unsigned char seg0 = data[8];
+        unsigned char seg1 = data[9];
+
+        set_bw_from_he_6ghz_width(net, width, seg0, seg1);
+    }
+}
+
+static void parse_eht_operation(struct network *net, const unsigned char *data, size_t len) {
+    unsigned char op_params;
+    int has_op_info;
+
+    if (len < 5) {
+        return;
+    }
+
+    op_params = data[0];
+    has_op_info = op_params & 0x01;
+
+    if (has_op_info && len >= 8) {
+        unsigned char control = data[5];
+        unsigned char width = control & 0x07;
+
+        set_standard(net, "11be", 5, "EHT operation");
+        set_bw_from_eht_width(net, width);
     }
 }
 
@@ -556,34 +769,16 @@ static void parse_ies(struct network *net, const unsigned char *ies, size_t len)
                     net->legacy_ofdm = 1;
                 }
             }
-        } else if (id == 61 && ie_len >= 2) {
-            unsigned char ht_info = ies[pos + 1];
-            unsigned char sec_offset = ht_info & 0x3;
-            set_standard(net, "11n", 2);
-            if ((ht_info & 0x4) != 0 && (sec_offset == 1 || sec_offset == 3)) {
-                set_bw(net, "40", 2);
-            }
+        } else if (id == 61) {
+            parse_ht_operation(net, ies + pos, ie_len);
         } else if (id == 45) {
-            set_standard(net, "11n", 2);
+            set_standard(net, "11n", 2, "HT capabilities");
         } else if (id == 48) {
             net->sec_flags |= SEC_RSN;
         } else if (id == 191) {
-            set_standard(net, "11ac", 3);
-        } else if (id == 192 && ie_len >= 1) {
-            set_standard(net, "11ac", 3);
-            switch (ies[pos]) {
-            case 1:
-                set_bw(net, "80", 3);
-                break;
-            case 2:
-                set_bw(net, "160", 4);
-                break;
-            case 3:
-                set_bw(net, "80+80", 5);
-                break;
-            default:
-                break;
-            }
+            set_standard(net, "11ac", 3, "VHT capabilities");
+        } else if (id == 192) {
+            parse_vht_operation(net, ies + pos, ie_len);
         } else if (id == 221 && ie_len >= 4) {
             const unsigned char *oui = ies + pos;
             if (oui[0] == 0x00 && oui[1] == 0x50 && oui[2] == 0xf2) {
@@ -594,14 +789,16 @@ static void parse_ies(struct network *net, const unsigned char *ies, size_t len)
                 }
             }
         } else if (id == 255 && ie_len >= 1) {
+            append_ext_id(net, ies[pos]);
             switch (ies[pos]) {
             case 35:
+                set_standard(net, "11ax", 4, "HE capabilities ext=35");
+                break;
             case 36:
-                set_standard(net, "11ax", 4);
+                parse_he_operation(net, ies + pos + 1, ie_len - 1);
                 break;
             case 106:
-            case 108:
-                set_standard(net, "11be", 5);
+                parse_eht_operation(net, ies + pos + 1, ie_len - 1);
                 break;
             default:
                 break;
@@ -610,6 +807,19 @@ static void parse_ies(struct network *net, const unsigned char *ies, size_t len)
 
         pos += ie_len;
     }
+}
+
+static void print_debug_network(const struct network *net) {
+    fprintf(stderr,
+        "debug %s ssid=\"%s\" freq=%d bw=%s source=\"%s\" std=%s source=\"%s\" ext_ids=[%s]\n",
+        net->bssid,
+        net->ssid[0] != '\0' ? net->ssid : "<hidden>",
+        net->freq,
+        net->bw[0] != '\0' ? net->bw : "-",
+        net->bw_source[0] != '\0' ? net->bw_source : "-",
+        net->standard[0] != '\0' ? net->standard : "-",
+        net->std_source[0] != '\0' ? net->std_source : "-",
+        net->ext_ids[0] != '\0' ? net->ext_ids : "-");
 }
 
 static int parse_bss_message(struct nlmsghdr *nlh, struct network_list *list) {
@@ -645,6 +855,10 @@ static int parse_bss_message(struct nlmsghdr *nlh, struct network_list *list) {
         net.channel = freq_to_channel(net.freq);
     }
 
+    if (bss[NL80211_BSS_CHAN_WIDTH] != NULL) {
+        set_bw_from_chan_width(&net, nla_get_u32(bss[NL80211_BSS_CHAN_WIDTH]));
+    }
+
     if (bss[NL80211_BSS_SEEN_MS_AGO] != NULL) {
         net.last_seen_ms = nla_get_u32(bss[NL80211_BSS_SEEN_MS_AGO]);
     }
@@ -671,7 +885,7 @@ static int parse_bss_message(struct nlmsghdr *nlh, struct network_list *list) {
             nla_data(bss[NL80211_BSS_INFORMATION_ELEMENTS]),
             (size_t) nla_payload_len(bss[NL80211_BSS_INFORMATION_ELEMENTS]));
     }
-    if (net.ssid[0] == '\0' && bss[NL80211_BSS_BEACON_IES] != NULL) {
+    if (bss[NL80211_BSS_BEACON_IES] != NULL) {
         parse_ies(&net,
             nla_data(bss[NL80211_BSS_BEACON_IES]),
             (size_t) nla_payload_len(bss[NL80211_BSS_BEACON_IES]));
@@ -681,10 +895,14 @@ static int parse_bss_message(struct nlmsghdr *nlh, struct network_list *list) {
         snprintf(net.ssid, sizeof(net.ssid), "<hidden>");
     }
     if (net.bw[0] == '\0') {
-        set_bw(&net, "20", 1);
+        set_bw(&net, "20", 1, "fallback");
     }
     finalize_standard(&net);
     summarize_security(&net);
+
+    if (is_debug_bssid(&net)) {
+        print_debug_network(&net);
+    }
 
     return push_network(list, &net);
 }
@@ -880,6 +1098,12 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
             iface = argv[++i];
+        } else if (strcmp(argv[i], "--debug-bssid") == 0) {
+            if (i + 1 >= argc) {
+                print_usage(argv[0]);
+                return 1;
+            }
+            g_debug_bssid = argv[++i];
         } else {
             print_usage(argv[0]);
             return 1;
